@@ -20,6 +20,8 @@ UU supplies the transport. The existing sshd still authenticates SSH users and k
 
 The project retains terminal QR login, per-machine identity and credentials, cloud signaling and reconnects, port mapping and its required CONTROL/TEXT initialization, and TCP lifecycle/backpressure handling.
 
+An explicit, one-shot device-card cover upload is also available without a desktop.
+
 Desktop capture, keyboard/mouse injection, clipboard, audio/video processing, privacy screens, PAM unlock, GUI, the native viewer, remote assistance, and UU's built-in terminal/file manager have been removed. **Use the system SSH/SFTP service through port mapping.** Some inert media negotiation metadata remains for official protocol compatibility; no desktop or audio/video stream is captured or generated.
 
 ## Build
@@ -64,8 +66,36 @@ Identity environment variables take precedence over the file. If the service env
 | `login [--no-gui]` | Terminal QR login |
 | `run` or no argument | Run the persistent host |
 | `doctor` | Local diagnostics without credentials; not a cloud/SSH connectivity test |
+| `set-wallpaper [--] <image>` | Upload an image and update the current identity's device-card cover |
 | `version` / `--version` | Print version |
 | `help` / `--help` | Print usage |
+
+## Set a device-card cover
+
+`set-wallpaper` is a one-shot cloud operation: it uploads your chosen local PNG, JPEG or WebP to the NetEase UU file service, then updates the current signed-in identity's device card. It does not set the Linux desktop wallpaper, discover a desktop background, capture a screenshot or poll for changes. It leaves `run` and the persistent service behavior unchanged.
+
+```sh
+uuremote-server set-wallpaper ./cover.png
+uuremote-server set-wallpaper "/srv/pictures/server cover.jpg"
+# For a filename starting with -:
+uuremote-server set-wallpaper -- -cover.webp
+uuremote-server set-wallpaper --help
+```
+
+Both relative and absolute paths are accepted. Relative paths use the command's working directory; quote paths containing spaces. The local limit is **10 MiB (10,485,760 bytes)**, also constrained by the service's returned `max_size`. The command does not resize or convert images.
+
+A complete, valid login identity is required. The command uses the current user's default configuration or the path selected by `UU_CONFIG`; identity environment variables still override the file. To update a service's device card, use its user, the same machine's configuration path and the corresponding identity environment. Never copy another machine's configuration. The following paths are examples; the executing user must be able to read the image:
+
+```sh
+sudo -u cabinw env UU_CONFIG=/var/lib/cabinw-uu/config.json \
+  /usr/local/bin/uuremote-server set-wallpaper /var/lib/cabinw-uu/cover.png
+```
+
+Missing or expired credentials cause failure without starting QR login automatically. Run `login` explicitly in an interactive terminal using the same identity, then retry. Remove or update any expired `UU_TOKEN` environment override as well. `set-wallpaper --help` (or `-h`) prints usage without uploading an image.
+
+**Running this command uploads the image contents, including any embedded metadata.** Choose an image you intend to send to UU's cloud service for device-card display; the command does not strip metadata. Success means the cloud API accepted the update, not that every client has refreshed. Client caching, cropping and cover removal remain unverified; there is no clear/reset command.
+
+Exit codes: `0` for success or help; `1` for file, credential, network or API errors; `2` for command syntax errors. See the [cover documentation](docs/wallpaper.md) for protocol evidence and validation scope.
 
 ## Linux service
 

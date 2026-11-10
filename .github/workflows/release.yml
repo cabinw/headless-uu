@@ -37,7 +37,7 @@ jobs:
           cp target/release/uuremote-server packaging/tarball/install.sh LICENSE README.md README.en.md "$name/"
           cp packaging/systemd/cabinw-uuremote.service "$name/packaging/systemd/"
           mkdir -p "$name/docs" "$name/docker"
-          cp docs/headless-phase-a.md docs/headless-refactor.md "$name/docs/"
+          cp docs/headless-phase-a.md docs/headless-refactor.md docs/wallpaper.md "$name/docs/"
           cp docker/README.md "$name/docker/"
           mkdir -p "$name/third-party"
           find vendor -type f \( -iname 'license*' -o -iname 'copying*' -o -iname 'notice*' -o -name 'PATCHES.md' \) -exec cp --parents {} "$name/third-party/" \;

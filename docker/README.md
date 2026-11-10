@@ -24,6 +24,21 @@ docker compose -f docker/compose.yaml up -d
 
 Show the QR only to the account owner and exclude it from reports or public logs. Log in independently on each host; do not clone another machine's `config.json`. The container runs as UID/GID 10001. Only `/config` persists identity and credentials, and the config file should remain 0600. Keep volume ownership consistent if changing UID/GID.
 
+## 设备卡片封面 / Device-card cover
+
+已有有效登录时，可显式上传一张已放入绑定目录的图片。下面假定宿主的 `docker/config/cover.png` 已存在且 UID 10001 可读，对应容器内 `/config/cover.png`；命令使用容器当前配置与身份环境，不停止宿主服务。
+
+With an existing valid login, explicitly upload an image already placed in the bind mount. This example assumes `docker/config/cover.png` exists on the host and is readable by UID 10001, making it available as `/config/cover.png` inside the container. The command uses the container's current configuration and identity environment without stopping its host service.
+
+```sh
+docker compose -f docker/compose.yaml exec headless-uu \
+  uuremote-server set-wallpaper /config/cover.png
+```
+
+该操作将图片原始内容和已有元数据发送给 UU 文件服务。支持 PNG/JPEG/WebP，本地限值 10 MiB，同时受服务端 `max_size` 限制。成功表示 API 接受更新，不保证官方客户端立即刷新；凭据缺失或过期时先显式登录。详见[封面说明](../docs/wallpaper.md)。
+
+This uploads the image's original contents and embedded metadata to UU's file service. PNG/JPEG/WebP are accepted, with a local 10 MiB limit and the service's `max_size` limit. Success means the API accepted the update, without guaranteeing immediate client refresh. Missing or expired credentials require explicit login first. See the [cover documentation](../docs/wallpaper.md).
+
 ## 验证与停用 / Verify and stop
 
 ```sh

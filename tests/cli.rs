@@ -1,7 +1,8 @@
 //! Process-level checks use an empty, isolated configuration; no cloud or account is contacted.
 use std::{
+    io::Read,
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
     time::{Duration, Instant},
 };
 struct Fixture(PathBuf);
@@ -36,6 +37,117 @@ impl Drop for Child {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+fn bounded_output(mut command: Command) -> Output {
+    let mut child = Child(
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "CLI command did not finish");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    child
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
+    child
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+#[test]
+fn wallpaper_cli_help_and_invalid_arguments_never_create_identity() {
+    let fixture = Fixture::new();
+    for args in [
+        vec!["set-wallpaper"],
+        vec!["set-wallpaper", "--unknown"],
+        vec!["set-wallpaper", "one", "two"],
+        vec!["set-wallpaper", "--"],
+    ] {
+        let mut command = fixture.command();
+        command.args(args);
+        assert_eq!(bounded_output(command).status.code(), Some(2));
+    }
+    for flag in ["--help", "-h"] {
+        let mut command = fixture.command();
+        command.args(["set-wallpaper", flag]);
+        let output = bounded_output(command);
+        assert!(output.status.success());
+        let help = String::from_utf8_lossy(&output.stdout);
+        assert!(help.contains("PNG/JPEG/WebP"));
+        assert!(help.contains("UU's file service"));
+    }
+    assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 0);
+}
+
+#[test]
+fn wallpaper_cli_reports_local_failures_without_leaking_data_or_writing_credentials() {
+    use base64::Engine;
+    let fixture = Fixture::new();
+    let image = fixture.0.join("private-path-封面 image.png");
+    std::fs::write(&image, base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNg+A8AAQIBAEK+vGgAAAAASUVORK5CYII=").unwrap()).unwrap();
+    let invalid = fixture.0.join("private-path-not-image.txt");
+    std::fs::write(&invalid, b"private-file-content").unwrap();
+    let large = fixture.0.join("private-path-large.png");
+    std::fs::File::create(&large)
+        .unwrap()
+        .set_len(10 * 1024 * 1024 + 1)
+        .unwrap();
+    let missing = fixture.0.join("private-path-missing.png");
+    for path in [&invalid, &large, &missing, &fixture.0, &image] {
+        let mut command = fixture.command();
+        command.arg("set-wallpaper").arg(path);
+        let output = bounded_output(command);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("Operation failed"));
+        for private in ["private-path", "private-file-content"] {
+            assert!(!error.contains(private));
+        }
+        assert!(!fixture.0.join("config.json").exists());
+        assert!(!fixture.0.join("config.host.lock").exists());
+    }
+    // A malformed or incomplete configuration is reported without echoing its contents,
+    // auto-login, or replacing the user's existing identity.
+    let config = fixture.0.join("config.json");
+    for bytes in [
+        b"private-invalid-config".as_slice(),
+        br#"{"token":"private-account-token"}"#.as_slice(),
+    ] {
+        std::fs::write(&config, bytes).unwrap();
+        let mut command = fixture.command();
+        command.arg("set-wallpaper").arg(&image);
+        let output = bounded_output(command);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!error.contains("private-"));
+        assert!(!error.contains(&fixture.0.to_string_lossy().to_string()));
+        assert_eq!(std::fs::read(&config).unwrap(), bytes);
+    }
+    assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 4);
 }
 #[test]
 fn cli_rejects_removed_tools_and_redirected_qr_without_creating_identity() {

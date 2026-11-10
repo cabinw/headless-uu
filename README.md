@@ -24,6 +24,7 @@ UU 负责建立通道，原有 sshd 继续验证 SSH 用户和密钥，客户端
 - 云信令、心跳、重连和会话管理。
 - 官方端口映射协议及其必要的 CONTROL/TEXT 初始化。
 - 多 TCP 流转发、背压、取消、关闭和诊断日志。
+- 显式的一次性设备卡片封面上传，不依赖桌面。
 
 已移除远程桌面、键鼠、剪贴板、音视频采集与编解码、隐私屏、PAM 解锁、GUI、原生控制端、远程协助，以及 UU 内置终端和文件管理。**SSH/SFTP 通过端口映射使用系统服务。** 部分媒体协商元数据仍为官方协议兼容保留，不会采集桌面或生成音视频。
 
@@ -69,8 +70,36 @@ Cargo 包名为 `cabinw-uu-headless`。可执行文件保留 `uuremote-server` �
 | `login [--no-gui]` | 在终端完成二维码登录 |
 | `run` 或无参数 | 启动常驻宿主 |
 | `doctor` | 输出不含凭据的本地诊断；不代表云端或 SSH 已连通 |
+| `set-wallpaper [--] <image>` | 上传指定图片并更新当前身份的设备卡片封面 |
 | `version` / `--version` | 输出版本 |
 | `help` / `--help` | 输出用法 |
+
+## 设置设备卡片封面
+
+`set-wallpaper` 是一次性云操作：将你指定的本地 PNG、JPEG 或 WebP 上传到网易 UU 文件服务，再更新当前登录身份的设备卡片。它不设置 Linux 桌面壁纸，不发现桌面背景、不截屏、不轮询，也不改变 `run` 或常驻服务的行为。
+
+```sh
+uuremote-server set-wallpaper ./cover.png
+uuremote-server set-wallpaper "/srv/pictures/server cover.jpg"
+# 文件名以 - 开头时 / For a filename starting with -:
+uuremote-server set-wallpaper -- -cover.webp
+uuremote-server set-wallpaper --help
+```
+
+支持相对路径和绝对路径；相对路径基于执行命令时的工作目录，含空格的路径需要引号。本地文件上限为 **10 MiB（10,485,760 字节）**，同时受服务端返回的 `max_size` 限制。命令不会自动缩放或转换图片。
+
+必须已有完整、有效的登录身份。命令使用当前用户的默认配置，或 `UU_CONFIG` 指定的配置；身份环境变量继续优先于文件。为常驻服务设置封面时，使用该服务的用户、同一台机器的配置路径和相应身份环境。不要复制其他机器的配置。下面路径仅为示例，执行用户必须能读取图片：
+
+```sh
+sudo -u cabinw env UU_CONFIG=/var/lib/cabinw-uu/config.json \
+  /usr/local/bin/uuremote-server set-wallpaper /var/lib/cabinw-uu/cover.png
+```
+
+凭据缺失或过期会失败退出，不会自动启动扫码。先以同一身份在交互终端运行 `login`，再重试；过期的 `UU_TOKEN` 环境覆盖也必须移除或更新。`set-wallpaper --help`（或 `-h`）只显示用法，不上传图片。
+
+**执行该命令会上传图片内容，包括文件中已有的元数据。** 只选择你愿意交给 UU 云服务并用于设备卡片展示的图片；命令不提供元数据清理。成功表示云 API 已接受更新，不保证所有客户端立即刷新。客户端的缓存、裁剪和清除封面的行为尚未验证，当前没有清除或恢复默认封面的命令。
+
+退出码：`0` 表示成功或显示帮助；`1` 表示文件、凭据、网络或 API 错误；`2` 表示命令语法错误。协议依据与验证范围见[封面说明](docs/wallpaper.md)。
 
 ## Linux 常驻服务
 

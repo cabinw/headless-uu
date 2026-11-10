@@ -8,11 +8,14 @@ This is `cabinw/headless-uu`, a GPL-3.0-or-later fork of `VallierDev/uu-remote-l
 
 The product is a dedicated headless host for official UU port mapping. Keep per-machine device identity, CLI QR login, cloud signaling/heartbeats/reconnects, cloud ICE/TURN policy, DTLS/SCTP, and TCP forwarding. Authentication and file access belong to the target service, normally the existing sshd providing SSH/SFTP.
 
+The explicit `set-wallpaper [--] <image>` CLI command is an allowed, independent cloud feature: upload one user-selected PNG/JPEG/WebP and update the current signed-in identity's device-card cover. Require an existing complete identity; do not register a device or start login automatically. Keep it outside the daemon lifecycle, with no desktop discovery, screenshot capture, wallpaper polling or graphical dependencies. See [the cover protocol and validation notes](docs/wallpaper.md).
+
 Do not reintroduce desktop capture, input injection, clipboard, GUI, codecs/encoders, native viewer, remote assistance, power operations, PAM, or UU's built-in terminal/file manager. Inert media negotiation and nominal screen messages may remain where official tool clients require them; that does not authorize adding a desktop subsystem.
 
 ## Working rules
 
 - Never log tokens, passwords, QR URLs, TURN credentials, terminal text or forwarded bytes. Use sizes, counts, field numbers and booleans. QR codes are credentials: show only to the account owner during explicit login, never include in logs, issues, reports or commits.
+- For cover uploads, also keep image contents, local paths, file tokens, returned URLs and API response bodies out of logs and reports. Account API headers must never accompany requests to the file-upload service. Tests use synthetic credentials and local fixtures, never real account configuration or live uploads unless explicitly authorized.
 - Do not read or copy real account configuration as part of tests. Each machine owns its identity. Default configuration remains `~/.config/uuremote/config.json`, overridden by `UU_CONFIG`; preserve file `0600` and directory `0700`.
 - Keep logs in English and new user-facing CLI text bilingual through `crate::i18n::s` or `crate::tr!`. Update both READMEs for behavior changes.
 - Preserve upstream attribution, GPL obligations, third-party licenses and vendored patch explanations. Do not add NetEase app binaries, icons or screenshots.
@@ -43,6 +46,7 @@ The historical [phase A record](docs/headless-phase-a.md) explains earlier lifec
 - Echo replies acknowledge SimpleAction 0 with action 1 and `{"seq":...}`. Only declare implemented protocol features.
 - Keep the 256 KiB data-channel receive compatibility patch and the sent SDP `a=max-message-size:262144`; the stored local description cannot be altered indiscriminately. Official clients can send frames larger than 64 KiB.
 - Retain cloud ICE/TURN credentials and force-relay policy handling. `UU_USE_PROXY=1` opts into proxies; it does not mean force relay. Confirm actual path with `ICE path ... route=relay|direct`.
+- Device-card covers follow the observed file-token → raw image upload → signed `wallpaper_url` update flow. The 10 MiB limit is local, in addition to the server's `max_size`; it is not a claimed official limit. Do not infer automatic client refresh, cropping, cache eviction or a reset API from upload success.
 - Media SDP pruning is a separate compatibility experiment. Do not remove inert tracks/codecs/interceptors merely because no media is generated.
 
 ## Build and verification

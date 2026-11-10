@@ -1,59 +1,38 @@
 name: 问题反馈 / Bug report
-description: 报告 bug 或使用问题 / Report a bug or problem
+description: 无头登录、连接或 TCP 映射问题 / Headless login, connection or TCP mapping problem
 labels: [bug]
 body:
   - type: markdown
     attributes:
       value: |
-        感谢反馈！请尽量填写完整，否则我们很难定位问题。/ Thanks! Please fill in everything you can.
+        请勿提交 token、配置文件、二维码、SSH 私钥或转发内容。
+        Do not include tokens, configuration files, QR codes, SSH private keys or forwarded data.
   - type: textarea
     id: problem
     attributes:
-      label: 问题描述 / What happened
-      description: 做了什么操作、期望什么结果、实际发生了什么；能稳定复现吗？/ Steps, expected vs actual, reproducible?
+      label: 复现步骤与结果 / Steps and result
+      description: 包含预期行为、实际行为及是否可重复 / Include expected behavior, actual behavior and reproducibility.
     validations:
       required: true
   - type: input
     id: version
     attributes:
-      label: 版本 / Version
-      description: Release 版本号（如 v0.1.1）或自己编译的提交号 / Release tag or commit
+      label: 版本或 commit / Version or commit
     validations:
       required: true
-  - type: dropdown
-    id: viewer
+  - type: input
+    id: client
     attributes:
-      label: 控制端 / Viewer
-      options: [Mac, Windows, iPhone / iPad, Android, 其他 / Other]
+      label: 官方客户端平台和版本 / Official client platform and version
     validations:
       required: true
   - type: textarea
     id: diagnostics
     attributes:
-      label: 诊断信息 / Diagnostics
+      label: 本地诊断 / Local diagnostics
       description: |
-        先复现一次问题，然后在被控 Linux 的**图形桌面里打开的终端**中运行下面的命令（SSH 或 tty 里缺少桌面环境变量，doctor 结果不准），把输出粘贴到这里（IPv4/IPv6/MAC 地址会被自动抹掉，不包含密码、令牌或剪贴板内容）。
-        Reproduce the problem, then run this in a terminal **inside the Linux graphical session** (SSH/tty lacks the desktop environment, so doctor would be misleading) and paste the output (IPv4/IPv6/MAC addresses are masked; no passwords, tokens or clipboard data).
-
-        ```sh
-        {
-          echo "== doctor (v0.2.17+)"; uuremote-server doctor
-          echo "== 系统"; grep PRETTY_NAME /etc/os-release; uname -rm
-          echo "== 桌面"; echo "session=$XDG_SESSION_TYPE desktop=$XDG_CURRENT_DESKTOP"
-          echo "== 显示器"; xrandr --listmonitors 2>/dev/null
-          echo "== 缩放"; gsettings get org.gnome.desktop.interface scaling-factor 2>/dev/null; gsettings get org.gnome.mutter experimental-features 2>/dev/null
-          echo "== 显卡"; lspci 2>/dev/null | grep -iE 'vga|3d'
-          echo "== FFmpeg"; ffmpeg -hide_banner -encoders 2>/dev/null | grep -E 'h264_nvenc|libx264'
-          echo "== 日志"; journalctl --user -u uuremote-native.service --since "-30min" --no-pager -o cat \
-            | grep -E 'Starting|backend|Selected capture|Desktop encoder|Capture setting request|Desktop video settings|Offer for connection|PeerConnection State|Remote controller disconnected|ICE path|Port mapping|WARN|ERROR' \
-            | grep -vE 'webrtc_ice|webrtc_dtls|webrtc::mux' | tail -n 120
-        } 2>&1 | sed -E 's/[0-9]{1,3}(\.[0-9]{1,3}){3}/x.x.x.x/g; s/([0-9a-fA-F]{1,4}:){4,7}[0-9a-fA-F]{1,4}|[0-9a-fA-F]{0,4}::[0-9a-fA-F:]*[0-9a-fA-F]/x:x::x/g'
-        ```
+        提供 uuremote-server doctor、操作系统/架构，以及当前连接 route=direct 或 route=relay。
+        如需日志，只贴与问题相关且已审查的行。不要贴完整 config.json 或登录输出。
+        Include uuremote-server doctor, OS/architecture and the current connection's route=direct or route=relay.
+        Review any relevant log lines before posting. Never attach config.json or login output.
       render: text
-    validations:
-      required: true
-  - type: textarea
-    id: extra
-    attributes:
-      label: 截图或补充说明 / Screenshots, notes
-      description: 显示缩放比例（如 125%）、多显示器、是否用 NVIDIA 显卡等 / Display scaling, multiple monitors, GPU, ...

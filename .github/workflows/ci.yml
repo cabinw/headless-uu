@@ -1,163 +1,40 @@
-name: CI
-
+name: Headless CI
 on:
   push:
     branches: [main]
   pull_request:
-
+  workflow_dispatch:
+permissions:
+  contents: read
 jobs:
-  test-macos-ssh-paste:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: python3 -m unittest discover -s contrib/macos-ssh -p 'test_*.py' -v
-      - name: Test file-URL clipboard reader on a private pasteboard
-        run: |
-          swiftc -O contrib/macos-ssh/clipboard-files.swift -o "$RUNNER_TEMP/clipboard-files"
-          "$RUNNER_TEMP/clipboard-files" --self-test
-
   test:
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config \
-            libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev \
-            libwayland-dev libwayland-bin libxkbcommon-dev xvfb xauth fonts-noto-cjk
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked
-      - name: GTK appearance and settings smoke tests
-        run: xvfb-run -a -s '-screen 0 1600x1200x24' sh tests/gtk-ui-smoke.sh "$RUNNER_TEMP/gtk-ui-previews"
-      - name: Synthetic GTK previews
-        if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: gtk-ui-previews
-          path: ${{ runner.temp }}/gtk-ui-previews
-          if-no-files-found: ignore
-      # Same as the release job: the wayland plugin is built on 22.04; libei is unavailable here, so
-      # the portal plugin is skipped with a warning (release builds it on 24.04).
-      - name: Release feature set
-        run: |
-          cargo build --locked --features wayland,portal,engine-plugins --bin uuremote-server
-          test -f target/debug/libuu-wayland.so
-      - name: Debian package installs
-        run: |
-          packaging/deb/build-deb.sh 0.0.0~ci target/debug /tmp/deb
-          dpkg-deb -I /tmp/deb/*.deb | grep -E 'Depends|Recommends'
-          sudo apt-get install -y /tmp/deb/*.deb
-          uuremote-server --help | head -1
-          test -f /usr/lib/uu-remote-linux/libuu-wayland.so
-          systemd-analyze verify /usr/lib/systemd/user/uuremote-native.service
-      # The tarball installer must bring FFmpeg back on a machine without it (no FFmpeg = no picture).
-      - name: Tarball install script
-        run: |
-          shellcheck packaging/tarball/install.sh
-          sudo apt-get remove -y ffmpeg || true
-          if command -v ffmpeg; then echo "ffmpeg still present"; exit 1; fi
-          pkg=$(mktemp -d)
-          cp target/debug/uuremote-server target/debug/libuu-wayland.so packaging/tarball/install.sh "$pkg/"
-          cp -r contrib "$pkg/"
-          home=$(mktemp -d)
-          HOME=$home XDG_CONFIG_HOME=$home/.config "$pkg/install.sh" --yes
-          ffmpeg -hide_banner -encoders | grep -qw libx264
-          test -x "$home/.local/bin/uuremote-server" && test -f "$home/.local/lib/uu-remote-linux/libuu-wayland.so"
-          grep -q '^ExecStart=%h/.local/bin/uuremote-server$' "$home/.config/systemd/user/uuremote-native.service"
-          HOME=$home XDG_CONFIG_HOME=$home/.config "$pkg/install.sh" --yes | grep -q 'Kept existing'
-
-  test-viewer:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install build dependencies (X11 + GTK + SDL2 + ffmpeg CLI for the viewer)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config \
-            libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev libsdl2-dev ffmpeg
-      - uses: dtolnay/rust-toolchain@stable
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked --features native-viewer,viewer-sdl --bin uuremote-viewer
-      - run: cargo build --locked --features native-viewer,viewer-sdl --bin uuremote-viewer
-
-  test-wayland:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install build dependencies (X11 + Wayland + portal)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config \
-            libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev \
-            libwayland-dev libxkbcommon-dev libglib2.0-dev libpipewire-0.3-dev libei-dev libeis-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked --features wayland,portal
-      # Release layout: engines as runtime-loaded plugins; uuremote-server must not link them.
-      - name: Engine plugins
-        run: |
-          cargo build --locked --features wayland,portal,engine-plugins --bin uuremote-server
-          for lib in libuu-wayland.so libuu-portal.so; do test -f "target/debug/$lib"; done
-          ! readelf -d target/debug/uuremote-server | grep NEEDED | grep -E 'libei|libpipewire|libwayland-client|libxkbcommon'
-      - name: Native portal and EIS regression tests (ASan/UBSan)
-        env:
-          ASAN_OPTIONS: detect_leaks=1
-          UBSAN_OPTIONS: halt_on_error=1
-        run: |
-          for source in tests/portal_engine.c tests/portal_dmabuf.c tests/portal_input.c tests/portal_eis.c tests/desktop_power.c tests/wayland_transform.c; do
-            target="/tmp/$(basename "$source" .c)"
-            cc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-              -Wall -Wextra -Wno-unused-parameter "$source" -o "$target" \
-              $(pkg-config --cflags --libs gio-2.0 gio-unix-2.0 libpipewire-0.3 libei-1.0 libeis-1.0) -lpthread -lm
-            "$target"
-          done
-
-  test-inproc:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install build dependencies (X11; inproc-av vendors the NVENC headers; the VAAPI/DRI3 engines need libva/gbm/xcb-dri3 headers, libva itself is dlopen'ed at runtime)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config \
-            libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev \
-            libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage0-dev \
-            libpulse-dev libopus-dev xvfb xauth \
-            libwayland-dev libxkbcommon-dev libglib2.0-dev libpipewire-0.3-dev libei-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Read-only uinput text keymap regression
-        run: |
-          cc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-            -Wall -Wextra tests/uinput_keymap.c -o /tmp/uu-uinput-keymap-test -lX11
-          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
-            xvfb-run -a /tmp/uu-uinput-keymap-test
-      - run: cargo test --locked --features inproc-av
-      - run: cargo test --locked --features inproc-av,wayland,portal
-
-  test-linux-arm64:
-    # aarch64 hosts (Ampere A1, arm64 VMs, Apple-silicon VMs) build from source, so keep that
-    # build honest on a native arm64 runner instead of letting it rot between releases.
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config \
-            libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev \
-            libwayland-dev libwayland-bin libxkbcommon-dev libglib2.0-dev libpipewire-0.3-dev libei-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
       - run: cargo test --locked
-      - name: Release binary
+      - run: cargo build --locked --bin uuremote-server
+      - run: target/debug/uuremote-server help
+      - name: Verify no graphical or media linkage
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
-          cargo build --locked --release --bin uuremote-server
-          file target/release/uuremote-server
-      # The aarch64 release package ships both engine plugins.
-      - name: Release feature set
+          readelf -d target/debug/uuremote-server > "$RUNNER_TEMP/headless-needed.txt"
+          cat "$RUNNER_TEMP/headless-needed.txt"
+          if grep NEEDED "$RUNNER_TEMP/headless-needed.txt" | grep -Eiq 'lib(gtk|gdk|X11|Xext|Xtst|Xfixes|xcb|wayland|avcodec|avformat|avdevice|swscale|SDL|pipewire|pulse|opus|pam)'; then
+            exit 1
+          fi
+      - name: Validate packaging script and service
+        if: runner.os == 'Linux'
         run: |
-          cargo build --locked --features wayland,portal,engine-plugins --bin uuremote-server
-          for lib in libuu-wayland.so libuu-portal.so; do test -f "target/debug/$lib"; done
+          sh -n packaging/tarball/install.sh
+          sed "s|ExecStart=/usr/local/bin/uuremote-server run|ExecStart=$GITHUB_WORKSPACE/target/debug/uuremote-server run|" packaging/systemd/cabinw-uuremote.service > "$RUNNER_TEMP/cabinw-uuremote.service"
+          systemd-analyze verify "$RUNNER_TEMP/cabinw-uuremote.service"

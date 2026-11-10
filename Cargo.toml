@@ -1,38 +1,18 @@
 [package]
-name = "uu-remote-linux"
-version = "0.2.57"
+name = "cabinw-uu-headless"
+version = "0.3.0"
 edition = "2021"
 default-run = "uuremote-server"
-authors = ["uu-remote-linux contributors"]
-description = "Unofficial Linux host for NetEase UU Remote: control a Linux desktop from the official clients"
+authors = ["cabinw", "uu-remote-linux contributors"]
+description = "Headless UU Remote host for port mapping and SSH access"
 readme = "README.md"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/VallierDev/uu-remote-linux"
+repository = "https://github.com/cabinw/headless-uu"
 
 # The executable keeps its established name (deploy scripts, systemd units, docs).
 [[bin]]
 name = "uuremote-server"
 path = "src/main.rs"
-
-[[bin]]
-name = "uuremote-viewer"
-path = "src/viewer_main.rs"
-required-features = ["native-viewer"]
-
-[features]
-default = []
-native-viewer = []
-viewer-ffmpeg = ["native-viewer", "dep:ffmpeg-next"]
-viewer-sdl = ["native-viewer", "dep:sdl2", "dep:ab_glyph", "dep:png"]
-wayland = []
-# Experimental direct linear framebuffer capture; never enabled in release builds.
-kms = []
-portal = []
-# Build the wayland/portal engines as runtime-loaded libuu-wayland.so / libuu-portal.so (release packages).
-engine-plugins = []
-# In-process X11 capture and NVENC encoding: vendored NVENC headers, NVIDIA driver libraries loaded at runtime.
-# Other encoders keep the FFmpeg process pipeline. Off by default.
-inproc-av = ["dep:x11rb"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -47,29 +27,17 @@ hex = "0.4"
 base64 = "0.22"
 flate2 = "1.0"
 bytes = "1"
-async-trait = "0.1"
 rand = "0.8"
 webrtc = "0.10"
 libc = "0.2"
-nix = { version = "0.29", features = ["term", "process", "fs", "ioctl", "signal"] }
 log = "0.4"
 qrcode = { version = "0.14", default-features = false }
 env_logger = "0.11"
-ffmpeg-next = { version = "6.1", optional = true, default-features = false, features = ["codec", "format", "device", "software-scaling", "software-resampling"] }
-x11rb = { version = "0.13", features = ["damage", "shm", "allow-unsafe-code"], optional = true }
-
-sdl2 = { version = "0.37", optional = true, features = ["use-pkgconfig"] }
-ab_glyph = { version = "0.2", optional = true }
-png = { version = "0.18", optional = true }
-
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 # Synthetic loopback WSS certificates only; both crates already occur in Cargo.lock.
 rcgen = "0.11.3"
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
-
-[build-dependencies]
-cc = "1.0"
 
 [patch.crates-io]
 # RTP rollover counter survives delayed NACK retransmissions (vendor/webrtc-srtp/PATCHES.md).
@@ -79,8 +47,3 @@ webrtc-dtls = { path = "vendor/webrtc-dtls" }
 webrtc = { path = "vendor/webrtc" }
 # TURN over TCP/TLS through an HTTP CONNECT proxy (vendor/webrtc-ice/PATCHES.md).
 webrtc-ice = { path = "vendor/webrtc-ice" }
-
-[[bench]]
-name = "nvenc_pipeline_bench"
-harness = false
-required-features = ["inproc-av"]

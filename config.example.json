@@ -7,6 +7,5 @@
   "machine_guid": "<machine guid>",
   "token": "<access token (JWT)>",
   "csrf": "<csrf token>",
-  "sign_key": "<optional: overrides the built-in signing key>",
-  "ffmpeg_root": "<optional: bundled FFmpeg prefix; default uses ffmpeg on PATH>"
+  "sign_key": "<optional: overrides the built-in signing key>"
 }

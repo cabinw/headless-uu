@@ -2,6 +2,9 @@ target/
 *.log
 .DS_Store
 
+# Docker's persistent account identity must never enter Git or build context.
+/docker/config/
+
 # Internal QA records and handoffs stay private (kept under the parent project analysis/)
 /docs/validation/
 /docs/ACTIVE_HANDOFF.md

@@ -1,0 +1,31 @@
+[Unit]
+Description=Cabinw UU headless TCP mapping host
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=cabinw
+Group=cabinw
+StateDirectory=cabinw-uu
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/cabinw-uu
+Environment=HOME=/var/lib/cabinw-uu
+Environment=UU_CONFIG=/var/lib/cabinw-uu/config.json
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/uuremote-server run
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

@@ -172,6 +172,8 @@ The [2026-11-11 live validation record](docs/live-validation-2026-11-11.md) (Chi
 
 The [concurrency and early-close validation](docs/extreme-validation-2026-11-11.md) (Chinese), using official macOS client 4.46.0 (630), records a local host head-of-line blocking fix. Release passed application-ACK controls at 64×512 KiB over ThinkPad's direct path and 64×64 KiB over Tencent relay. Both paths still showed truncation during recovery with immediate target closure and slow reads followed by FIN; Tencent also failed the 64×512 KiB burst. Application ACKs are diagnostic only, and these results do not establish that all issues are resolved.
 
+The subsequent [SCTP delayed-ACK fix and validation](docs/sctp-ack-timer-2026-11-11.md) (Chinese) repairs timer rearming after expiry and cancellation while waiting for the observer lock. Lifecycle and real-SCTP regressions fail against the original crate and pass with the patch. Mapping close semantics remain unchanged; see that record for live results and remaining limitations.
+
 Automated validation covers local TCP, real SCTP, queue closure, packet-loss recovery and reconnects. This does not replace official-client, real-relay, SSH/SFTP or long-duration validation. Upstream results and the [phase A record](docs/headless-phase-a.md) describe their historical versions, not official-client acceptance of this complete refactor.
 
 ## Attribution and license

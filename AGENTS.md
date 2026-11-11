@@ -30,7 +30,7 @@ Do not reintroduce desktop capture, input injection, clipboard, GUI, codecs/enco
 - `src/wire/`: protobuf primitives and the minimal official tool compatibility messages.
 - `src/runtime/`: process lifecycle, command-line helpers and internationalization.
 - `src/main.rs`: command routing and module wiring.
-- `vendor/`: patched WebRTC/ICE/DTLS/SRTP dependencies. Keep their licenses and patches as path dependencies unless deliberately replacing and revalidating them.
+- `vendor/`: patched WebRTC/ICE/DTLS/SRTP/SCTP dependencies. Keep their licenses and patches as path dependencies unless deliberately replacing and revalidating them.
 - `packaging/systemd/`: optional system-service example. It runs as an ordinary user and does not require a graphical session.
 - `docker/`: optional source-built container; host networking means loopback targets the Linux Docker host.
 

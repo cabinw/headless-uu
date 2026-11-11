@@ -35,6 +35,8 @@ qrcode = { version = "0.14", default-features = false }
 env_logger = "0.11"
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+# Exercise the actual vendored ACK timer with an offline observer and fake clock.
+async-trait = "0.1"
 # Synthetic loopback WSS certificates only; both crates already occur in Cargo.lock.
 rcgen = "0.11.3"
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
@@ -47,3 +49,5 @@ webrtc-dtls = { path = "vendor/webrtc-dtls" }
 webrtc = { path = "vendor/webrtc" }
 # TURN over TCP/TLS through an HTTP CONNECT proxy (vendor/webrtc-ice/PATCHES.md).
 webrtc-ice = { path = "vendor/webrtc-ice" }
+# Delayed ACK rearm and cancellation (vendor/webrtc-sctp/PATCHES.md).
+webrtc-sctp = { path = "vendor/webrtc-sctp" }

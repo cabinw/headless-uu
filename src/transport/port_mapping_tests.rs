@@ -455,6 +455,116 @@ async fn completed_stream_tokens_do_not_accumulate_for_distinct_identities() {
     assert!(session.state.lock().unwrap().retired.is_empty());
 }
 
+async fn queued_unbound_replies_before_reuse(kind: u64, ended: bool) {
+    let (session, mut queue) = session(4);
+    if ended {
+        let (mut target, task) = open(&session, &mut queue).await;
+        target.shutdown().await.unwrap();
+        assert_eq!(next(&mut queue).await.1, FIN);
+        finished(&task).await;
+        assert!(session.state.lock().unwrap().streams.is_empty());
+    }
+    for _ in 0..2 {
+        receive(&session, kind, b"not a valid SYN").await;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    session.syn(key(), &syn_payload(&listener));
+    let replacement = session.state.lock().unwrap().streams[&key()].task.clone();
+    let (mut target, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    for _ in 0..2 {
+        let pending = queue.recv().await.unwrap();
+        assert_eq!(pending.frame.1, if kind == DATA { FIN } else { SYN_ACK });
+        assert!(
+            pending
+                .cancelled
+                .is_some_and(|token| token.load(Ordering::Acquire)),
+            "a response queued before identity reuse must not reach the replacement"
+        );
+    }
+    let pending = queue.recv().await.unwrap();
+    assert_eq!(pending.frame.1, SYN_ACK);
+    assert!(!pending.cancelled.unwrap().load(Ordering::Acquire));
+    receive(&session, DATA, b"replacement").await;
+    let mut bytes = [0; 11];
+    tokio::time::timeout(Duration::from_secs(3), target.read_exact(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&bytes, b"replacement");
+    session.shutdown();
+    finished(&replacement).await;
+}
+
+#[tokio::test]
+async fn queued_unbound_unknown_data_fin_cannot_close_reused_identity() {
+    for ended in [false, true] {
+        queued_unbound_replies_before_reuse(DATA, ended).await;
+    }
+}
+
+#[tokio::test]
+async fn queued_unbound_invalid_syn_ack_cannot_reject_reused_identity() {
+    for ended in [false, true] {
+        queued_unbound_replies_before_reuse(SYN, ended).await;
+    }
+}
+
+#[tokio::test]
+async fn inactive_replies_preserve_live_streams_and_release_distinct_identity_tokens() {
+    let (session, mut queue) = session(1);
+    let (mut target, task) = open(&session, &mut queue).await;
+    let live = session.state.lock().unwrap().streams[&key()]
+        .cancelled
+        .clone();
+    // A concurrent SYN can make an initially missing stream active before a late reply is built.
+    assert!(session
+        .state
+        .lock()
+        .unwrap()
+        .inactive_reply(&key(), FIN, Vec::new())
+        .is_none());
+    receive(&session, SYN, b"invalid duplicate SYN").await;
+    assert!(queue.try_recv().is_err());
+    assert!(!live.load(Ordering::Acquire));
+    receive(&session, DATA, b"live").await;
+    let mut bytes = [0; 4];
+    target.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(&bytes, b"live");
+    for kind in [DATA, SYN] {
+        for stream_id in 100..1100 {
+            let mut id = key();
+            id.stream = Id::Varint(stream_id);
+            let message = crate::initialization::envelope(
+                1,
+                0,
+                MESSAGE_FIELD,
+                &frame(&id, kind, b"invalid SYN or late DATA"),
+            );
+            session
+                .handle(&decode_wire(&message).unwrap(), "FILE_DATA_CHANNEL")
+                .await;
+            let pending = queue.recv().await.unwrap();
+            assert_eq!(pending.frame.1, if kind == DATA { FIN } else { SYN_ACK });
+            assert!(!pending.cancelled.as_ref().unwrap().load(Ordering::Acquire));
+            drop(pending);
+            let state = session.state.lock().unwrap();
+            assert_eq!(state.streams.len(), 1);
+            assert!(state.retired.len() <= 1);
+            assert!(state
+                .retired
+                .values()
+                .all(|token| token.upgrade().is_none()));
+            assert!(!live.load(Ordering::Acquire));
+        }
+    }
+    session.shutdown();
+    finished(&task).await;
+    assert!(session.state.lock().unwrap().retired.is_empty());
+}
+
 // Exercise the actual vendored SCTP buffered-amount callback with packet loss and recovery.
 #[tokio::test]
 async fn sctp_backpressure_resumes_on_low_water_and_shutdown_does_not_wait_for_drain() {

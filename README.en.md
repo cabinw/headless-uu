@@ -166,6 +166,8 @@ CI runs Linux/macOS tests and checks the Linux executable for graphical/media li
 
 See the [refactor record](docs/headless-refactor.md) (Chinese) for the architecture changes, test results and acceptance boundaries.
 
+The [2026-11-11 live validation record](docs/live-validation-2026-11-11.md) (Chinese) covers the official macOS client, SSH/SFTP and synthetic TCP over observed direct and relay paths. File hashes matched in both directions, but new-stream recovery after abnormal disconnects and 64-stream concurrency still had failures. These results do not establish full compatibility or long-term stability.
+
 Automated validation covers local TCP, real SCTP, queue closure, packet-loss recovery and reconnects. This does not replace official-client, real-relay, SSH/SFTP or long-duration validation. Upstream results and the [phase A record](docs/headless-phase-a.md) describe their historical versions, not official-client acceptance of this complete refactor.
 
 ## Attribution and license

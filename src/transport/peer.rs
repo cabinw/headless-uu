@@ -224,7 +224,8 @@ impl WebRtcSession {
                 if !matches!(label.as_str(), "FILE_DATA_CHANNEL" | "CONTROL_DATA_CHANNEL" | "TEXT_DATA_CHANNEL") {
                     let _ = channel.close().await; return;
                 }
-                log::info!("Tool DataChannel received: {}", label);
+                log::info!("Tool DataChannel received: {} ordered={} max_packet_lifetime={} max_retransmits={}",
+                    label, channel.ordered(), channel.max_packet_lifetime(), channel.max_retransmits());
                 if label == "FILE_DATA_CHANNEL" {
                     *slot.lock().unwrap() = Some(channel.clone());
                     mapping.attach_channel(&channel).await;

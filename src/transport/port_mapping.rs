@@ -42,6 +42,8 @@ struct PendingFrame {
     frame: Outbound,
     cancelled: Option<Arc<AtomicBool>>,
 }
+// Only test queue fillers may omit cancellation; every production response is bound to a token.
+#[cfg(test)]
 impl From<Outbound> for PendingFrame {
     fn from(frame: Outbound) -> Self {
         Self {
@@ -170,10 +172,26 @@ struct State {
     closed: bool,
     generation: u64,
     streams: HashMap<Key, Stream>,
-    // Completed tasks may still have DATA/FIN/failed ACKs waiting in the outbound queue.
-    // Weak tokens keep those frames cancellable without retaining every finished stream.
+    // Completed tasks and inactive-stream replies can still be waiting in the outbound queue.
+    // Weak tokens keep those frames cancellable without retaining every finished identity.
     retired: HashMap<Key, Weak<AtomicBool>>,
     outbound_task: Option<tokio::task::AbortHandle>,
+}
+impl State {
+    fn inactive_reply(&mut self, key: &Key, kind: u64, payload: Vec<u8>) -> Option<PendingFrame> {
+        if self.closed || self.streams.contains_key(key) {
+            return None;
+        }
+        self.retired.retain(|_, token| token.strong_count() != 0);
+        let cancelled = self
+            .retired
+            .get(key)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        // Repeated late DATA shares the same token, so a later SYN/FIN cancels every reply.
+        self.retired.insert(key.clone(), Arc::downgrade(&cancelled));
+        Some(PendingFrame::stream(key, kind, payload, &cancelled))
+    }
 }
 
 pub struct Session {
@@ -374,7 +392,7 @@ impl Session {
         match kind {
             SYN => {
                 if let Some(reply) = self.syn(key, payload) {
-                    let _ = self.outbound.send(reply.into()).await;
+                    let _ = self.outbound.send(reply).await;
                 }
             }
             DATA => {
@@ -393,7 +411,14 @@ impl Session {
                         }
                     }
                     None => {
-                        let _ = self.outbound.send((key, FIN, Vec::new()).into()).await;
+                        let reply =
+                            self.state
+                                .lock()
+                                .unwrap()
+                                .inactive_reply(&key, FIN, Vec::new());
+                        if let Some(reply) = reply {
+                            let _ = self.outbound.send(reply).await;
+                        }
                     }
                 }
             }
@@ -404,13 +429,18 @@ impl Session {
         true
     }
 
-    fn syn(self: &Arc<Self>, key: Key, payload: &[u8]) -> Option<Outbound> {
+    fn syn(self: &Arc<Self>, key: Key, payload: &[u8]) -> Option<PendingFrame> {
         self.syn_with(key, payload, |host, port| {
             tokio::net::TcpStream::connect((host, port))
         })
     }
 
-    fn syn_with<F, C>(self: &Arc<Self>, key: Key, payload: &[u8], connect: F) -> Option<Outbound>
+    fn syn_with<F, C>(
+        self: &Arc<Self>,
+        key: Key,
+        payload: &[u8],
+        connect: F,
+    ) -> Option<PendingFrame>
     where
         F: FnOnce(String, u16) -> C,
         C: std::future::Future<Output = std::io::Result<tokio::net::TcpStream>> + Send + 'static,
@@ -434,9 +464,10 @@ impl Session {
         let (host, port) = match request {
             Ok(target) => target,
             Err(error) => {
+                let reply = state.inactive_reply(&key, SYN_ACK, syn_ack(false, Some(&error)));
                 drop(state);
                 log::info!("Port mapping SYN rejected: {}", error);
-                return Some((key, SYN_ACK, syn_ack(false, Some(&error))));
+                return reply;
             }
         };
         state.generation += 1;

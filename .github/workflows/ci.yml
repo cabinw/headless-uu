@@ -21,6 +21,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo test --locked
+      - name: Check synthetic TCP probe (offline)
+        run: python3 tests/support/tcp_mapping_probe.py selfcheck
       - run: cargo build --locked --bin uuremote-server
       - run: target/debug/uuremote-server help
       - name: Verify no graphical or media linkage

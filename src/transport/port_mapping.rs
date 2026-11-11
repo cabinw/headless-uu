@@ -12,10 +12,10 @@
 //! official controlled-side switch.
 
 use crate::protocol::{decode_wire, WireField, WireValue};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Notify};
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
@@ -35,12 +35,102 @@ const WRITE_QUEUE_FRAMES: usize = 256;
 /// Pause reading targets while this much is queued on the data channel.
 const MAX_BUFFERED: usize = 4 * 1024 * 1024;
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTROL_QUEUE_FRAMES: usize = 64;
 type Outbound = (Key, u64, Vec<u8>);
+static DIAGNOSTIC_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Process-local counters only: no wire identity, target address or payload is retained.
+#[derive(Debug)]
+struct FlowDiagnostics {
+    generation: u64,
+    started: Instant,
+    identity_reuse: bool,
+    duplicate_syn: AtomicBool,
+    reason: Mutex<&'static str>,
+    rx_data_frames: AtomicU64,
+    rx_data_bytes: AtomicU64,
+    target_read: AtomicU64,
+    target_written: AtomicU64,
+    queued_frames: AtomicU64,
+    queued_data: AtomicU64,
+    sent_frames: AtomicU64,
+    sent_data: AtomicU64,
+    cancelled_data: AtomicU64,
+}
+impl FlowDiagnostics {
+    fn new(identity_reuse: bool) -> Arc<Self> {
+        Arc::new(Self {
+            generation: DIAGNOSTIC_GENERATION.fetch_add(1, Ordering::Relaxed),
+            started: Instant::now(),
+            identity_reuse,
+            duplicate_syn: AtomicBool::new(false),
+            reason: Mutex::new("active"),
+            rx_data_frames: AtomicU64::new(0),
+            rx_data_bytes: AtomicU64::new(0),
+            target_read: AtomicU64::new(0),
+            target_written: AtomicU64::new(0),
+            queued_frames: AtomicU64::new(0),
+            queued_data: AtomicU64::new(0),
+            sent_frames: AtomicU64::new(0),
+            sent_data: AtomicU64::new(0),
+            cancelled_data: AtomicU64::new(0),
+        })
+    }
+    fn end(&self, reason: &'static str, failed: bool) {
+        let mut current = self.reason.lock().unwrap();
+        let changed = *current != reason;
+        if *current == "active" {
+            *current = reason;
+        }
+        if failed && changed {
+            log::warn!(
+                "Port mapping stream failed: generation={} reason={}",
+                self.generation,
+                reason
+            );
+        }
+    }
+    fn report(&self, stage: &'static str) {
+        log::debug!("Port mapping flow: generation={} stage={} age_ms={} reason={} duplicate_syn={} identity_reuse={} rx_data_frames={} rx_data_bytes={} target_read={} target_written={} queued_frames={} queued_data={} dc_sent_frames={} dc_sent_data={} cancelled_data={}",
+            self.generation, stage, self.started.elapsed().as_millis(), *self.reason.lock().unwrap(),
+            self.duplicate_syn.load(Ordering::Relaxed), self.identity_reuse,
+            self.rx_data_frames.load(Ordering::Relaxed), self.rx_data_bytes.load(Ordering::Relaxed),
+            self.target_read.load(Ordering::Relaxed), self.target_written.load(Ordering::Relaxed),
+            self.queued_frames.load(Ordering::Relaxed), self.queued_data.load(Ordering::Relaxed),
+            self.sent_frames.load(Ordering::Relaxed), self.sent_data.load(Ordering::Relaxed),
+            self.cancelled_data.load(Ordering::Relaxed));
+    }
+    fn queued(&self, kind: u64, length: usize) {
+        self.queued_frames.fetch_add(1, Ordering::Relaxed);
+        if kind == DATA {
+            self.queued_data.fetch_add(length as u64, Ordering::Relaxed);
+        }
+    }
+}
+impl Drop for FlowDiagnostics {
+    fn drop(&mut self) {
+        // Pending frames retain these counters after the target task exits.
+        self.report("released");
+    }
+}
+
+#[derive(Debug, Default)]
+struct StreamToken {
+    cancelled: AtomicBool,
+    fin_pending: AtomicBool,
+}
+impl std::ops::Deref for StreamToken {
+    type Target = AtomicBool;
+    fn deref(&self) -> &Self::Target {
+        &self.cancelled
+    }
+}
 
 #[derive(Debug)]
 struct PendingFrame {
     frame: Outbound,
-    cancelled: Option<Arc<AtomicBool>>,
+    cancelled: Option<Arc<StreamToken>>,
+    diagnostics: Option<Arc<FlowDiagnostics>>,
 }
 // Only test queue fillers may omit cancellation; every production response is bound to a token.
 #[cfg(test)]
@@ -49,15 +139,24 @@ impl From<Outbound> for PendingFrame {
         Self {
             frame,
             cancelled: None,
+            diagnostics: None,
         }
     }
 }
 impl PendingFrame {
-    fn stream(key: &Key, kind: u64, payload: Vec<u8>, cancelled: &Arc<AtomicBool>) -> Self {
+    fn stream(key: &Key, kind: u64, payload: Vec<u8>, cancelled: &Arc<StreamToken>) -> Self {
+        if kind == FIN {
+            cancelled.fin_pending.store(true, Ordering::Release);
+        }
         Self {
             frame: (key.clone(), kind, payload),
             cancelled: Some(cancelled.clone()),
+            diagnostics: None,
         }
+    }
+    fn tracked(mut self, diagnostics: &Arc<FlowDiagnostics>) -> Self {
+        self.diagnostics = Some(diagnostics.clone());
+        self
     }
 }
 
@@ -164,7 +263,8 @@ struct Stream {
     // Local write overflow must send FIN in order, even while the outbound queue is full.
     close: Option<oneshot::Sender<()>>,
     generation: u64,
-    cancelled: Arc<AtomicBool>,
+    cancelled: Arc<StreamToken>,
+    diagnostics: Arc<FlowDiagnostics>,
 }
 
 #[derive(Default)]
@@ -174,8 +274,11 @@ struct State {
     streams: HashMap<Key, Stream>,
     // Completed tasks and inactive-stream replies can still be waiting in the outbound queue.
     // Weak tokens keep those frames cancellable without retaining every finished identity.
-    retired: HashMap<Key, Weak<AtomicBool>>,
+    retired: HashMap<Key, Weak<StreamToken>>,
     outbound_task: Option<tokio::task::AbortHandle>,
+    control_queue: VecDeque<PendingFrame>,
+    control_task: Option<tokio::task::AbortHandle>,
+    diagnostics_task: Option<tokio::task::AbortHandle>,
 }
 impl State {
     fn inactive_reply(&mut self, key: &Key, kind: u64, payload: Vec<u8>) -> Option<PendingFrame> {
@@ -187,8 +290,12 @@ impl State {
             .retired
             .get(key)
             .and_then(Weak::upgrade)
-            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        // Repeated late DATA shares the same token, so a later SYN/FIN cancels every reply.
+            .unwrap_or_else(|| Arc::new(StreamToken::default()));
+        // One FIN suffices while this incarnation's FIN is still waiting to be sent.
+        // This also recognizes the normal target-EOF FIN retained after registration ends.
+        if kind == FIN && cancelled.fin_pending.load(Ordering::Acquire) {
+            return None;
+        }
         self.retired.insert(key.clone(), Arc::downgrade(&cancelled));
         Some(PendingFrame::stream(key, kind, payload, &cancelled))
     }
@@ -198,6 +305,8 @@ pub struct Session {
     outbound: mpsc::Sender<PendingFrame>,
     state: Mutex<State>,
     writable: Arc<Notify>,
+    control_ready: Arc<Notify>,
+    control_overflow: Arc<Notify>,
     buffer_limit: usize,
 }
 
@@ -252,13 +361,17 @@ impl Session {
             outbound,
             state: Mutex::new(State::default()),
             writable: Arc::new(Notify::new()),
+            control_ready: Arc::new(Notify::new()),
+            control_overflow: Arc::new(Notify::new()),
             buffer_limit,
         });
+        session.start_control_dispatcher(channel.clone());
         let (weak, writable) = (Arc::downgrade(&session), session.writable.clone());
         let task = tokio::spawn(async move {
             while let Some(PendingFrame {
                 frame: (key, kind, payload),
                 cancelled,
+                diagnostics,
             }) = queue.recv().await
             {
                 // One deadline covers channel readiness, SCTP backpressure and send itself.
@@ -270,6 +383,13 @@ impl Session {
                             .as_ref()
                             .is_some_and(|c| c.load(Ordering::Acquire))
                         {
+                            if kind == DATA {
+                                if let Some(diagnostics) = &diagnostics {
+                                    diagnostics
+                                        .cancelled_data
+                                        .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                                }
+                            }
                             return true;
                         }
                         let slot = channel.lock().unwrap().clone();
@@ -291,7 +411,19 @@ impl Session {
                                         MESSAGE_FIELD,
                                         &frame(&key, kind, &payload),
                                     );
-                                    return dc.send(&bytes::Bytes::from(message)).await.is_ok();
+                                    let sent = dc.send(&bytes::Bytes::from(message)).await.is_ok();
+                                    if sent {
+                                        if let Some(diagnostics) = &diagnostics {
+                                            diagnostics.sent_frames.fetch_add(1, Ordering::Relaxed);
+                                            if kind == DATA {
+                                                diagnostics.sent_data.fetch_add(
+                                                    payload.len() as u64,
+                                                    Ordering::Relaxed,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    return sent;
                                 }
                                 _ => {}
                             }
@@ -301,6 +433,17 @@ impl Session {
                 })
                 .await;
                 if sent != Ok(true) {
+                    if let Some(diagnostics) = &diagnostics {
+                        diagnostics.end(
+                            if sent.is_err() {
+                                "outbound_send_timeout"
+                            } else {
+                                "outbound_send_error"
+                            },
+                            true,
+                        );
+                        diagnostics.report("outbound_failed");
+                    }
                     log::warn!(
                         "Port mapping send unavailable or timed out; closing mapping session"
                     );
@@ -320,7 +463,122 @@ impl Session {
             }
         });
         session.state.lock().unwrap().outbound_task = Some(task.abort_handle());
+        if log::log_enabled!(log::Level::Debug) {
+            session.start_diagnostics();
+        }
         session
+    }
+
+    fn start_diagnostics(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let task = tokio::spawn(async move {
+            let period = Duration::from_secs(5);
+            let mut interval =
+                tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(session) = weak.upgrade() else { break };
+                let (flows, control_pending, closed) = {
+                    let state = session.state.lock().unwrap();
+                    (
+                        state
+                            .streams
+                            .values()
+                            .map(|stream| stream.diagnostics.clone())
+                            .collect::<Vec<_>>(),
+                        state.control_queue.len(),
+                        state.closed,
+                    )
+                };
+                let outbound_pending =
+                    session.outbound.max_capacity() - session.outbound.capacity();
+                drop(session);
+                log::debug!("Port mapping snapshot: active={} outbound_pending={} control_pending={} closed={}",
+                    flows.len(), outbound_pending, control_pending, closed);
+                for flow in flows {
+                    flow.report("active");
+                }
+            }
+        });
+        self.state.lock().unwrap().diagnostics_task = Some(task.abort_handle());
+    }
+
+    fn start_control_dispatcher(
+        self: &Arc<Self>,
+        channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
+    ) {
+        let weak = Arc::downgrade(self);
+        let outbound = self.outbound.clone();
+        let ready = self.control_ready.clone();
+        let overflow = self.control_overflow.clone();
+        let task = tokio::spawn(async move {
+            let dispatch = async {
+                loop {
+                    let notified = ready.notified();
+                    // Do not retain the Session across a queue wait: its Drop must cancel us.
+                    let pending = match weak.upgrade() {
+                        Some(session) => session.state.lock().unwrap().control_queue.pop_front(),
+                        None => return,
+                    };
+                    match pending {
+                        Some(pending) => {
+                            if pending
+                                .cancelled
+                                .as_ref()
+                                .is_some_and(|c| c.load(Ordering::Acquire))
+                            {
+                                continue;
+                            }
+                            if outbound.send(pending).await.is_err() {
+                                return;
+                            }
+                        }
+                        None => notified.await,
+                    }
+                }
+            };
+            tokio::select! {
+                biased;
+                _ = overflow.notified() => {
+                    // Saturation is explicit to this viewer; never silently lose its FIN/ACK.
+                    let dc = channel.lock().unwrap().clone();
+                    if let Some(dc) = dc {
+                        let _ = tokio::time::timeout(Duration::from_secs(2), dc.close()).await;
+                    }
+                }
+                _ = dispatch => {}
+            }
+        });
+        self.state.lock().unwrap().control_task = Some(task.abort_handle());
+    }
+
+    fn queue_control(&self, pending: PendingFrame) {
+        let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return;
+        }
+        // A new SYN/remote FIN invalidates queued replies for the old incarnation. Pruning
+        // here keeps repeated invalid SYNs bounded, even when the ordinary FIFO is full.
+        state.control_queue.retain(|frame| {
+            !frame
+                .cancelled
+                .as_ref()
+                .is_some_and(|c| c.load(Ordering::Acquire))
+        });
+        if state.control_queue.len() < CONTROL_QUEUE_FRAMES {
+            state.control_queue.push_back(pending);
+            drop(state);
+            self.control_ready.notify_one();
+        } else {
+            state.closed = true;
+            // The dispatcher performs the final FILE close; shutdown cancels all other work.
+            state.control_task.take();
+            drop(state);
+            log::warn!("Port mapping session failed: reason=control_queue_full");
+            self.control_overflow.notify_one();
+            self.shutdown();
+        }
     }
 
     /// FILE has one owner of these callbacks; CONTROL/TEXT keep their existing handlers.
@@ -392,7 +650,7 @@ impl Session {
         match kind {
             SYN => {
                 if let Some(reply) = self.syn(key, payload) {
-                    let _ = self.outbound.send(reply).await;
+                    self.queue_control(reply);
                 }
             }
             DATA => {
@@ -402,12 +660,26 @@ impl Session {
                     .unwrap()
                     .streams
                     .get(&key)
-                    .map(|s| s.writer.clone());
+                    .map(|s| (s.writer.clone(), s.diagnostics.clone()));
                 match writer {
-                    Some(writer) => {
-                        if writer.try_send(payload.to_vec()).is_err() {
-                            log::warn!("Port mapping write buffer full; closing stream");
-                            self.close(&key, true);
+                    Some((writer, diagnostics)) => {
+                        diagnostics.rx_data_frames.fetch_add(1, Ordering::Relaxed);
+                        diagnostics
+                            .rx_data_bytes
+                            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                        match writer.try_send(payload.to_vec()) {
+                            Ok(()) => {}
+                            Err(error) => {
+                                diagnostics.end(
+                                    if matches!(error, mpsc::error::TrySendError::Full(_)) {
+                                        "rx_queue_full"
+                                    } else {
+                                        "target_writer_closed"
+                                    },
+                                    true,
+                                );
+                                self.close(&key, true);
+                            }
                         }
                     }
                     None => {
@@ -417,7 +689,7 @@ impl Session {
                                 .unwrap()
                                 .inactive_reply(&key, FIN, Vec::new());
                         if let Some(reply) = reply {
-                            let _ = self.outbound.send(reply).await;
+                            self.queue_control(reply);
                         }
                     }
                 }
@@ -448,9 +720,18 @@ impl Session {
         let mut state = self.state.lock().unwrap();
         // A duplicate SYN never replaces a live or pending TCP connection. A new SYN is
         // accepted after FIN/cleanup; old task cleanup is generation-checked.
-        if state.closed || state.streams.contains_key(&key) {
+        if state.closed {
             return None;
         }
+        if let Some(stream) = state.streams.get(&key) {
+            stream
+                .diagnostics
+                .duplicate_syn
+                .store(true, Ordering::Relaxed);
+            stream.diagnostics.report("duplicate_syn");
+            return None;
+        }
+        let identity_reuse = state.retired.contains_key(&key);
         state.retired.retain(|_, token| token.strong_count() != 0);
         if let Some(cancelled) = state.retired.remove(&key).and_then(|token| token.upgrade()) {
             cancelled.store(true, Ordering::Release);
@@ -480,27 +761,33 @@ impl Session {
         let (writer, writes) = mpsc::channel(WRITE_QUEUE_FRAMES);
         let (close, closing) = oneshot::channel();
         let (outbound, task_key) = (self.outbound.clone(), key.clone());
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(StreamToken::default());
         let task_cancelled = cancelled.clone();
+        let diagnostics = FlowDiagnostics::new(identity_reuse);
+        diagnostics.report("registered");
+        let task_diagnostics = diagnostics.clone();
         let connecting = connect(host.clone(), port);
         let task = tokio::spawn(async move {
             let _registration = registration;
             let send_fin = tokio::select! {
                 biased;
-                _ = closing => true,
-                result = Self::forward(&outbound, &task_key, &host, port, connecting, writes, &task_cancelled) => result,
+                _ = closing => { task_diagnostics.end("local_close", false); true },
+                result = Self::forward(&outbound, &task_key, &host, port, connecting, writes, &task_cancelled, &task_diagnostics) => result,
             };
+            task_diagnostics.report("target_closed");
             // forward's socket halves have been dropped before waiting for queue capacity.
             // Remote FIN and peer shutdown can still abort this tracked task while it waits.
             if send_fin {
-                let _ = outbound
-                    .send(PendingFrame::stream(
-                        &task_key,
-                        FIN,
-                        Vec::new(),
-                        &task_cancelled,
-                    ))
-                    .await;
+                if outbound
+                    .send(
+                        PendingFrame::stream(&task_key, FIN, Vec::new(), &task_cancelled)
+                            .tracked(&task_diagnostics),
+                    )
+                    .await
+                    .is_ok()
+                {
+                    task_diagnostics.queued(FIN, 0);
+                }
             }
         });
         state.streams.insert(
@@ -511,6 +798,7 @@ impl Session {
                 close: Some(close),
                 generation,
                 cancelled,
+                diagnostics,
             },
         );
         None
@@ -523,7 +811,8 @@ impl Session {
         port: u16,
         connecting: impl std::future::Future<Output = std::io::Result<tokio::net::TcpStream>>,
         mut writes: mpsc::Receiver<Vec<u8>>,
-        cancelled: &Arc<AtomicBool>,
+        cancelled: &Arc<StreamToken>,
+        diagnostics: &Arc<FlowDiagnostics>,
     ) -> bool {
         log::info!(
             "Port mapping connecting: port={} loopback={}",
@@ -534,19 +823,29 @@ impl Session {
         let stream = match connected {
             Ok(Ok(stream)) => stream,
             result => {
+                diagnostics.end(
+                    if result.is_err() {
+                        "connect_timeout"
+                    } else {
+                        "connect_error"
+                    },
+                    true,
+                );
                 let error = match result {
                     Ok(Err(e)) => format!("connect failed: {}", e.kind()),
                     _ => "connect timeout".into(),
                 };
                 log::info!("Port mapping connect failed: {}", error);
-                let _ = outbound
-                    .send(PendingFrame::stream(
-                        key,
-                        SYN_ACK,
-                        syn_ack(false, Some(&error)),
-                        cancelled,
-                    ))
-                    .await;
+                if outbound
+                    .send(
+                        PendingFrame::stream(key, SYN_ACK, syn_ack(false, Some(&error)), cancelled)
+                            .tracked(diagnostics),
+                    )
+                    .await
+                    .is_ok()
+                {
+                    diagnostics.queued(SYN_ACK, 0);
+                }
                 return false;
             }
         };
@@ -555,32 +854,50 @@ impl Session {
         // The stream was registered before connecting; FIN during connect/ACK cancels it.
         // SYN_ACK and all target DATA share one ordered queue.
         if outbound
-            .send(PendingFrame::stream(
-                key,
-                SYN_ACK,
-                syn_ack(true, None),
-                cancelled,
-            ))
+            .send(
+                PendingFrame::stream(key, SYN_ACK, syn_ack(true, None), cancelled)
+                    .tracked(diagnostics),
+            )
             .await
             .is_err()
         {
+            diagnostics.end("outbound_queue_closed", true);
             return false;
         }
+        diagnostics.queued(SYN_ACK, 0);
         log::info!("Port mapping stream open: port={}", port);
         tokio::select! {
             result = async {
                 let mut buf = vec![0u8; READ_CHUNK];
                 loop {
                     match read.read(&mut buf).await {
-                        Ok(0) | Err(_) => return true,
-                        Ok(n) => if outbound.send(PendingFrame::stream(key, DATA, buf[..n].to_vec(), cancelled)).await.is_err() { return false; },
+                        Ok(0) => { diagnostics.end("target_eof", false); return true; },
+                        Err(_) => { diagnostics.end("target_read_error", true); return true; },
+                        Ok(n) => {
+                            diagnostics.target_read.fetch_add(n as u64, Ordering::Relaxed);
+                            if outbound.send(PendingFrame::stream(key, DATA, buf[..n].to_vec(), cancelled).tracked(diagnostics)).await.is_err() {
+                                diagnostics.end("outbound_queue_closed", true);
+                                return false;
+                            }
+                            diagnostics.queued(DATA, n);
+                        },
                     }
                 }
             } => result,
             _ = async {
                 while let Some(data) = writes.recv().await {
-                    if write.write_all(&data).await.is_err() { break; }
+                    let mut offset = 0;
+                    while offset < data.len() {
+                        match write.write(&data[offset..]).await {
+                            Ok(0) | Err(_) => { diagnostics.end("target_write_error", true); return; },
+                            Ok(n) => {
+                                offset += n;
+                                diagnostics.target_written.fetch_add(n as u64, Ordering::Relaxed);
+                            }
+                        }
+                    }
                 }
+                diagnostics.end("target_writer_closed", false);
             } => true,
         }
     }
@@ -595,6 +912,8 @@ impl Session {
             }
         } else {
             if let Some(stream) = state.streams.remove(key) {
+                stream.diagnostics.end("peer_fin", false);
+                stream.diagnostics.report("peer_fin");
                 // Frames still queued for this incarnation must not reach a reused wire identity.
                 stream.cancelled.store(true, Ordering::Release);
                 self.writable.notify_one();
@@ -614,6 +933,13 @@ impl Session {
         if let Some(task) = state.outbound_task.take() {
             task.abort();
         }
+        if let Some(task) = state.control_task.take() {
+            task.abort();
+        }
+        if let Some(task) = state.diagnostics_task.take() {
+            task.abort();
+        }
+        state.control_queue.clear();
         if !state.streams.is_empty() {
             log::info!(
                 "Port mapping closed {} stream(s) with the connection",
@@ -621,6 +947,8 @@ impl Session {
             );
         }
         for (_, stream) in state.streams.drain() {
+            stream.diagnostics.end("shutdown", false);
+            stream.diagnostics.report("shutdown");
             stream.task.abort();
         }
         state.retired.clear();
@@ -686,3 +1014,7 @@ mod tests {
 #[cfg(test)]
 #[path = "port_mapping_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "port_mapping_concurrency_tests.rs"]
+mod concurrency_tests;

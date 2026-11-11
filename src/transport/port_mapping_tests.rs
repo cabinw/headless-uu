@@ -3,16 +3,23 @@ use super::*;
 use tokio::net::{TcpListener, TcpStream};
 
 fn session(capacity: usize) -> (Arc<Session>, mpsc::Receiver<PendingFrame>) {
+    session_with_channel(capacity, None)
+}
+fn session_with_channel(
+    capacity: usize,
+    channel: Option<Arc<RTCDataChannel>>,
+) -> (Arc<Session>, mpsc::Receiver<PendingFrame>) {
     let (outbound, queue) = mpsc::channel(capacity);
-    (
-        Arc::new(Session {
-            outbound,
-            state: Mutex::new(State::default()),
-            writable: Arc::new(Notify::new()),
-            buffer_limit: MAX_BUFFERED,
-        }),
-        queue,
-    )
+    let session = Arc::new(Session {
+        outbound,
+        state: Mutex::new(State::default()),
+        writable: Arc::new(Notify::new()),
+        control_ready: Arc::new(Notify::new()),
+        control_overflow: Arc::new(Notify::new()),
+        buffer_limit: MAX_BUFFERED,
+    });
+    session.start_control_dispatcher(Arc::new(Mutex::new(channel)));
+    (session, queue)
 }
 fn key() -> Key {
     Key {
@@ -95,6 +102,34 @@ async fn tcp_round_trip_preserves_bytes_and_ack_data_fin_order() {
     target.await.unwrap();
     finished(&task).await;
     assert!(session.state.lock().unwrap().streams.is_empty());
+}
+
+#[tokio::test]
+async fn diagnostics_count_actual_tcp_bytes_and_keep_queued_data_distinct_from_sent() {
+    let (session, mut queue) = session(4);
+    let (mut target, task) = open(&session, &mut queue).await;
+    let diagnostics = session.state.lock().unwrap().streams[&key()]
+        .diagnostics
+        .clone();
+    receive(&session, SYN, b"duplicate SYN").await;
+    receive(&session, DATA, &[1; 31]).await;
+    target.read_exact(&mut [0; 31]).await.unwrap();
+    target.write_all(&[2; 63]).await.unwrap();
+    target.shutdown().await.unwrap();
+    assert_eq!(next(&mut queue).await.1, DATA);
+    assert_eq!(next(&mut queue).await.1, FIN);
+    finished(&task).await;
+    assert_eq!(diagnostics.rx_data_frames.load(Ordering::Relaxed), 1);
+    assert_eq!(diagnostics.rx_data_bytes.load(Ordering::Relaxed), 31);
+    assert_eq!(diagnostics.target_written.load(Ordering::Relaxed), 31);
+    assert_eq!(diagnostics.target_read.load(Ordering::Relaxed), 63);
+    assert_eq!(diagnostics.queued_data.load(Ordering::Relaxed), 63);
+    assert_eq!(diagnostics.queued_frames.load(Ordering::Relaxed), 3);
+    // This fixture drains the application queue directly, without a data-channel send.
+    assert_eq!(diagnostics.sent_data.load(Ordering::Relaxed), 0);
+    assert_eq!(diagnostics.sent_frames.load(Ordering::Relaxed), 0);
+    assert_eq!(*diagnostics.reason.lock().unwrap(), "target_eof");
+    assert!(diagnostics.duplicate_syn.load(Ordering::Relaxed));
 }
 
 #[tokio::test]
@@ -464,8 +499,17 @@ async fn queued_unbound_replies_before_reuse(kind: u64, ended: bool) {
         finished(&task).await;
         assert!(session.state.lock().unwrap().streams.is_empty());
     }
-    for _ in 0..2 {
+    for index in 0..2 {
         receive(&session, kind, b"not a valid SYN").await;
+        // Preserve an actually queued old response while the dispatcher is asynchronous.
+        let expected = if kind == DATA { 1 } else { index + 1 };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while queue.len() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     session.syn(key(), &syn_payload(&listener));
@@ -474,7 +518,8 @@ async fn queued_unbound_replies_before_reuse(kind: u64, ended: bool) {
         .await
         .unwrap()
         .unwrap();
-    for _ in 0..2 {
+    // Unknown DATA is coalesced while this incarnation already has a FIN pending.
+    for _ in 0..if kind == DATA { 1 } else { 2 } {
         let pending = queue.recv().await.unwrap();
         assert_eq!(pending.frame.1, if kind == DATA { FIN } else { SYN_ACK });
         assert!(
@@ -563,6 +608,249 @@ async fn inactive_replies_preserve_live_streams_and_release_distinct_identity_to
     session.shutdown();
     finished(&task).await;
     assert!(session.state.lock().unwrap().retired.is_empty());
+}
+
+async fn inactive_reply_keeps_file_receiver_available(kind: u64) {
+    let session = Session::new(Arc::new(Mutex::new(None)), Arc::new(AtomicU64::new(1)));
+    session
+        .outbound
+        .try_send((key(), DATA_ACK, Vec::new()).into())
+        .unwrap();
+    // The send worker is now parked waiting for a FILE channel; saturate its input too.
+    while session.outbound.capacity() != 64 {
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..64 {
+        session
+            .outbound
+            .try_send((key(), DATA_ACK, Vec::new()).into())
+            .unwrap();
+    }
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(30),
+            receive(&session, kind, b"invalid SYN or late DATA")
+        )
+        .await
+        .is_ok(),
+        "a control reply must not park the FILE receive callback behind outgoing data"
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    receive(&session, SYN, &syn_payload(&listener)).await;
+    let task = session.state.lock().unwrap().streams[&key()].task.clone();
+    receive(&session, FIN, &[]).await;
+    finished(&task).await;
+    assert!(session.state.lock().unwrap().streams.is_empty());
+    session.shutdown();
+}
+
+#[tokio::test]
+async fn unknown_data_reply_does_not_block_following_syn_and_fin() {
+    inactive_reply_keeps_file_receiver_available(DATA).await;
+}
+
+#[tokio::test]
+async fn invalid_syn_reply_does_not_block_following_syn_and_fin() {
+    inactive_reply_keeps_file_receiver_available(SYN).await;
+}
+
+#[tokio::test]
+async fn repeated_inactive_frames_are_bounded_and_shutdown_releases_dispatcher() {
+    for kind in [DATA, SYN] {
+        let (session, mut queue) = session(1);
+        session
+            .outbound
+            .try_send((key(), DATA_ACK, Vec::new()).into())
+            .unwrap();
+        receive(&session, kind, b"late DATA or invalid SYN").await;
+        // Park the single dispatcher on the full ordinary FIFO.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !session.state.lock().unwrap().control_queue.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for _ in 0..10_000 {
+            receive(&session, kind, b"late DATA or invalid SYN").await;
+        }
+        let (dispatcher, token) = {
+            let state = session.state.lock().unwrap();
+            assert!(!state.closed);
+            assert_eq!(state.retired.len(), 1);
+            assert_eq!(state.control_queue.len(), if kind == DATA { 0 } else { 1 });
+            (
+                state.control_task.clone().unwrap(),
+                state.retired[&key()].clone(),
+            )
+        };
+        let weak = Arc::downgrade(&session);
+        if kind == DATA {
+            session.shutdown();
+        }
+        drop(session); // Also exercise Drop while the dispatcher has an in-flight reply.
+        finished(&dispatcher).await;
+        assert!(weak.upgrade().is_none());
+        assert!(token.upgrade().is_none());
+        assert_eq!(next(&mut queue).await.1, DATA_ACK);
+        assert!(queue.recv().await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn target_eof_fin_already_queued_coalesces_late_data() {
+    let (session, mut queue) = session(4);
+    let (mut target, task) = open(&session, &mut queue).await;
+    target.shutdown().await.unwrap();
+    finished(&task).await;
+    assert_eq!(queue.len(), 1);
+    for _ in 0..1000 {
+        receive(&session, DATA, b"late").await;
+    }
+    assert!(session.state.lock().unwrap().control_queue.is_empty());
+    assert_eq!(queue.len(), 1);
+    assert_eq!(next(&mut queue).await.1, FIN);
+    session.shutdown();
+}
+
+#[tokio::test]
+async fn diagnostic_ticker_does_not_keep_session_alive_and_is_cancelled() {
+    for explicit_shutdown in [false, true] {
+        let (session, _queue) = session(1);
+        session.start_diagnostics();
+        let ticker = session
+            .state
+            .lock()
+            .unwrap()
+            .diagnostics_task
+            .clone()
+            .unwrap();
+        let weak = Arc::downgrade(&session);
+        tokio::task::yield_now().await;
+        if explicit_shutdown {
+            session.shutdown();
+        }
+        drop(session);
+        finished(&ticker).await;
+        assert!(weak.upgrade().is_none());
+    }
+}
+
+#[tokio::test]
+async fn distinct_control_overflow_closes_only_its_file_channel() {
+    use webrtc::api::APIBuilder;
+    let run = async {
+        let (left, right, router) = crate::test_network::virtual_network().await;
+        let mut peers = Vec::new();
+        for setting in [left, right] {
+            peers.push(
+                APIBuilder::new()
+                    .with_setting_engine(setting)
+                    .build()
+                    .new_peer_connection(Default::default())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let (tx, mut events) = mpsc::unbounded_channel();
+        peers[1].on_data_channel(Box::new(move |dc| {
+            let (opened, closed, message) = (tx.clone(), tx.clone(), tx.clone());
+            Box::pin(async move {
+                let label = dc.label().to_owned();
+                dc.on_close(Box::new(move || {
+                    let _ = closed.send((label.clone(), "closed"));
+                    Box::pin(async {})
+                }));
+                let label = dc.label().to_owned();
+                dc.on_message(Box::new(move |_| {
+                    let _ = message.send((label.clone(), "message"));
+                    Box::pin(async {})
+                }));
+                let _ = opened.send((dc.label().to_owned(), "created"));
+            })
+        }));
+        let file = peers[0]
+            .create_data_channel("FILE_DATA_CHANNEL", None)
+            .await
+            .unwrap();
+        let control = peers[0]
+            .create_data_channel("CONTROL_DATA_CHANNEL", None)
+            .await
+            .unwrap();
+        let mut gathered = peers[0].gathering_complete_promise().await;
+        peers[0]
+            .set_local_description(peers[0].create_offer(None).await.unwrap())
+            .await
+            .unwrap();
+        gathered.recv().await;
+        peers[1]
+            .set_remote_description(peers[0].local_description().await.unwrap())
+            .await
+            .unwrap();
+        let mut gathered = peers[1].gathering_complete_promise().await;
+        peers[1]
+            .set_local_description(peers[1].create_answer(None).await.unwrap())
+            .await
+            .unwrap();
+        gathered.recv().await;
+        peers[0]
+            .set_remote_description(peers[1].local_description().await.unwrap())
+            .await
+            .unwrap();
+        while file.ready_state() != RTCDataChannelState::Open
+            || control.ready_state() != RTCDataChannelState::Open
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (session, _queue) = session_with_channel(1, Some(file.clone()));
+        session.attach_channel(&file).await;
+        session
+            .outbound
+            .try_send((key(), DATA_ACK, Vec::new()).into())
+            .unwrap();
+        let dispatcher = session.state.lock().unwrap().control_task.clone().unwrap();
+        receive(&session, DATA, b"late").await;
+        while !session.state.lock().unwrap().control_queue.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        // An independent mapping peer has an established real target connection.
+        let (other, mut other_queue) = self::session(2);
+        let (mut target, target_task) = open(&other, &mut other_queue).await;
+        for stream_id in 100..=100 + CONTROL_QUEUE_FRAMES {
+            let mut id = key();
+            id.stream = Id::Varint(stream_id as u64);
+            let message =
+                crate::initialization::envelope(1, 0, MESSAGE_FIELD, &frame(&id, DATA, b"late"));
+            session
+                .handle(&decode_wire(&message).unwrap(), "FILE_DATA_CHANNEL")
+                .await;
+        }
+        assert!(session.state.lock().unwrap().closed);
+        assert!(session.state.lock().unwrap().control_queue.is_empty());
+        assert!(session.state.lock().unwrap().retired.is_empty());
+        finished(&dispatcher).await;
+        while events.recv().await.unwrap() != ("FILE_DATA_CHANNEL".to_owned(), "closed") {}
+        assert_eq!(control.ready_state(), RTCDataChannelState::Open);
+        control
+            .send(&bytes::Bytes::from_static(b"still open"))
+            .await
+            .unwrap();
+        while events.recv().await.unwrap() != ("CONTROL_DATA_CHANNEL".to_owned(), "message") {}
+        receive(&other, DATA, b"other peer").await;
+        let mut data = [0; 10];
+        target.read_exact(&mut data).await.unwrap();
+        assert_eq!(&data, b"other peer");
+        assert!(!other.state.lock().unwrap().closed);
+        other.shutdown();
+        finished(&target_task).await;
+        for peer in peers {
+            peer.close().await.unwrap();
+        }
+        router.lock().await.stop().await.unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("control overflow did not terminate cleanly");
 }
 
 // Exercise the actual vendored SCTP buffered-amount callback with packet loss and recovery.

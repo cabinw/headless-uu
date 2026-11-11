@@ -40,6 +40,8 @@ cargo build --release --locked --bin uuremote-server
 ./target/release/uuremote-server help
 ```
 
+Use a release build for live concurrency and throughput acceptance and record the build profile; stripping debug symbols does not provide release optimizations, and debug results are for development diagnostics rather than deployment acceptance.
+
 The Cargo package is `cabinw-uu-headless`. The executable remains `uuremote-server` for deployment compatibility. macOS is useful for development and local transport tests; the service instructions below target Linux/systemd.
 
 ## Login and run
@@ -167,6 +169,8 @@ CI runs Linux/macOS tests and checks the Linux executable for graphical/media li
 See the [refactor record](docs/headless-refactor.md) (Chinese) for the architecture changes, test results and acceptance boundaries.
 
 The [2026-11-11 live validation record](docs/live-validation-2026-11-11.md) (Chinese) covers the official macOS client, SSH/SFTP and synthetic TCP over observed direct and relay paths. File hashes matched in both directions, but new-stream recovery after abnormal disconnects and 64-stream concurrency still had failures. These results do not establish full compatibility or long-term stability.
+
+The [concurrency and early-close validation](docs/extreme-validation-2026-11-11.md) (Chinese), using official macOS client 4.46.0 (630), records a local host head-of-line blocking fix. Release passed application-ACK controls at 64×512 KiB over ThinkPad's direct path and 64×64 KiB over Tencent relay. Both paths still showed truncation during recovery with immediate target closure and slow reads followed by FIN; Tencent also failed the 64×512 KiB burst. Application ACKs are diagnostic only, and these results do not establish that all issues are resolved.
 
 Automated validation covers local TCP, real SCTP, queue closure, packet-loss recovery and reconnects. This does not replace official-client, real-relay, SSH/SFTP or long-duration validation. Upstream results and the [phase A record](docs/headless-phase-a.md) describe their historical versions, not official-client acceptance of this complete refactor.
 
